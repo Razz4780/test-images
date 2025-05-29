@@ -1,140 +1,118 @@
 use aws_sdk_sqs::types::MessageSystemAttributeName;
-use aws_sdk_sqs::{operation::receive_message::ReceiveMessageOutput, types::Message, Client};
-use tokio::time::{sleep, Duration};
+use aws_sdk_sqs::{types::Message, Client};
+use configuration::QueueConfig;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::task::JoinSet;
+use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 
-/// Name of the environment variable that holds the name of the SQS queue to read from.
-const QUEUE_NAME_ENV_VAR1: &str = "SQS_TEST_Q_NAME1";
+mod configuration;
 
-/// Name of the environment variable that holds the name of the SQS queue to write to.
-const ECHO_QUEUE_NAME_ENV_VAR1: &str = "SQS_TEST_ECHO_Q_NAME1";
-
-/// Name of the environment variable that holds the url of the second SQS queue to read from.
-/// Using URL, not name here, to test that functionality.
-const QUEUE2_URL_ENV_VAR: &str = "SQS_TEST_Q2_URL";
-
-/// Name of the environment variable that holds the name of the SQS queue to write to.
-const ECHO_QUEUE_NAME_ENV_VAR2: &str = "SQS_TEST_ECHO_Q_NAME2";
-
-/// Given Q name - read messages from that queue and echo them to the echo Q.
-async fn read_from_queue_by_name(
-    read_q_name: String,
-    echo_q_name: String,
+/// Read messages from the input queue and forward them to the output queue.
+async fn proxy_messages(
+    config: QueueConfig,
     client: Client,
-) -> Result<(), anyhow::Error> {
-    println!("Reading from Q: {read_q_name}, writing to echo Q: {echo_q_name}.");
-    let read_q_url = client
-        .get_queue_url()
-        .queue_name(&read_q_name)
-        .send()
-        .await
-        .inspect_err(|err| eprintln!("failed to get URL of queue {read_q_name}: {err:?}"))?
-        .queue_url
-        .unwrap();
-    println!("Successfully fetched queue URL: {read_q_url}");
-    read_from_queue_by_url(read_q_url, echo_q_name, client).await
-}
+    cancellation_token: CancellationToken,
+) {
+    println!("Starting message proxy for {config:?}");
 
-async fn read_from_queue_by_url(
-    read_q_url: String,
-    echo_q_name: String,
-    client: Client,
-) -> Result<(), anyhow::Error> {
-    let echo_q_url = client
-        .get_queue_url()
-        .queue_name(&echo_q_name)
-        .send()
-        .await
-        .inspect_err(|err| eprintln!("failed to get URL of queue {echo_q_name}: {err:?}"))?
-        .queue_url
-        .unwrap();
-    println!("Successfully fetched queue URL: {echo_q_url}");
+    let (input_url, output_url) = tokio::join!(
+        config.input.resolve_url(&client),
+        config.output.resolve_url(&client),
+    );
+
+    println!("Resolves queue URLs: input=[{input_url}], output=[{output_url}]");
 
     let receive_message_request = client
         .receive_message()
         .message_attribute_names(".*")
         .message_system_attribute_names(MessageSystemAttributeName::All)
         .wait_time_seconds(20)
-        .queue_url(&read_q_url);
+        .queue_url(&input_url);
+
     loop {
-        let res = match receive_message_request.clone().send().await {
-            Ok(res) => res,
-            Err(err) => {
-                println!("ERROR: {err:?}");
-                sleep(Duration::from_secs(3)).await;
+        let res = tokio::select! {
+            _ = cancellation_token.cancelled() => {
+                return;
+            },
+            res = receive_message_request.clone().send() => res,
+        };
+
+        let messages = match res {
+            Ok(res) => res.messages.unwrap_or_default(),
+            Err(error) => {
+                println!("Failed to read messages from input queue {input_url}: {error}");
+                tokio::time::sleep(Duration::from_secs(3)).await;
                 continue;
             }
         };
-        if let ReceiveMessageOutput {
-            messages: Some(messages),
+
+        for Message {
+            body,
+            message_attributes,
+            message_id,
+            receipt_handle,
+            mut attributes,
             ..
-        } = res
+        } in messages
         {
-            for Message {
-                body,
-                message_attributes,
-                message_id,
-                receipt_handle,
-                mut attributes,
-                ..
-            } in messages
+            println!("Received message: queue_url=[{input_url}], id=[{message_id:?}], message_attributes=[{message_attributes:?}], body=[{body:?}]");
+
+            let group_id = attributes
+                .as_mut()
+                .and_then(|attr_map| attr_map.remove(&MessageSystemAttributeName::MessageGroupId));
+
+            let deduplication_id = attributes.and_then(|mut attr_map| {
+                attr_map.remove(&MessageSystemAttributeName::MessageDeduplicationId)
+            });
+
+            println!("Forwaring message to {output_url}");
+            if let Err(error) = client
+                .send_message()
+                .queue_url(&output_url)
+                .set_message_attributes(message_attributes)
+                .set_message_group_id(group_id)
+                .set_message_deduplication_id(deduplication_id)
+                .set_message_body(body)
+                .send()
+                .await
             {
-                println!("message_id: {message_id:?}, message_attributes: {message_attributes:?}, body: {body:?}");
-                let group_id = attributes.as_mut().and_then(|attr_map| {
-                    attr_map.remove(&MessageSystemAttributeName::MessageGroupId)
-                });
-
-                let deduplication_id = attributes.and_then(|mut attr_map| {
-                    attr_map.remove(&MessageSystemAttributeName::MessageDeduplicationId)
-                });
-
-                println!("forwarding message to {echo_q_name}");
-                if let Err(err) = client
-                    .send_message()
-                    .queue_url(&echo_q_url)
-                    .set_message_attributes(message_attributes)
-                    .set_message_group_id(group_id)
-                    .set_message_deduplication_id(deduplication_id)
-                    .set_message_body(body)
+                println!("Failed to forward message to {output_url}: {error}");
+            } else if let Some(handle) = receipt_handle {
+                client
+                    .delete_message()
+                    .queue_url(&output_url)
+                    .receipt_handle(handle)
                     .send()
                     .await
-                {
-                    println!("failed to forward message to output queue: {err:?}");
-                } else if let Some(handle) = receipt_handle {
-                    client
-                        .delete_message()
-                        .queue_url(&read_q_url)
-                        .receipt_handle(handle)
-                        .send()
-                        .await
-                        .inspect_err(|err| println!("deleting received message failed: {err:?}"))
-                        .ok();
-                }
+                    .unwrap();
             }
         }
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let sdk_config = aws_config::load_from_env().await;
     let client = Client::new(&sdk_config);
-    let read_q_name = std::env::var(QUEUE_NAME_ENV_VAR1).unwrap();
-    let echo_queue_name = std::env::var(ECHO_QUEUE_NAME_ENV_VAR1).unwrap();
-    let q_task_handle = tokio::spawn(read_from_queue_by_name(
-        read_q_name,
-        echo_queue_name,
-        client.clone(),
-    ));
+    let queues = configuration::from_env();
 
-    // using URL on second queue to test that too.
-    let read_q_url = std::env::var(QUEUE2_URL_ENV_VAR).unwrap();
-    let echo_queue_name = std::env::var(ECHO_QUEUE_NAME_ENV_VAR2).unwrap();
-    let fifo_q_task_handle = tokio::spawn(read_from_queue_by_url(
-        read_q_url,
-        echo_queue_name,
-        client.clone(),
-    ));
-    let (q_res, fifo_res) = tokio::join!(q_task_handle, fifo_q_task_handle);
-    q_res.unwrap().unwrap();
-    fifo_res.unwrap().unwrap();
+    let mut tasks = JoinSet::new();
+    let cancellation_token = CancellationToken::new();
+    let signal_token = cancellation_token.clone();
+    let mut signal = signal(SignalKind::terminate()).unwrap();
+    tasks.spawn(async move {
+        let _ = signal.recv().await.unwrap();
+        signal_token.cancel();
+    });
+
+    for config in queues {
+        tasks.spawn(proxy_messages(
+            config,
+            client.clone(),
+            cancellation_token.clone(),
+        ));
+    }
+
+    tasks.join_all().await;
 }
